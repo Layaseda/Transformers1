@@ -2,7 +2,7 @@ import os
 import warnings
 warnings.simplefilter("ignore", category=FutureWarning)
 
-os.environ["WANDB_PROJECT"] = "sentiment_analyze"
+os.environ["WANDB_PROJECT"] = "gpt2-sentiment"
 os.environ["WANDB_LOG_MODEL"] = "end"
 
 import wandb
@@ -18,19 +18,19 @@ from transformers import GPT2Tokenizer
 
 
 # Initialize WandB
-wandb.init(project="sentiment_analyze", name="nanoGPT")
+wandb.init(project="sentiment_analyze", name="nanoGPT-weighted")
 
 
 # Define hyperparameters
 config = {
     "vocab_size": 50257,
     "max_length": 128,
-    "n_layers": 4,
-    "n_heads": 4,
-    "embed_dim": 128,
+    "n_layers": 6,
+    "n_heads": 8,
+    "embed_dim": 512,
     "dropout": 0.1,
     "batch_size": 8,
-    "lr": 1e-4,
+    "lr": 1e-5,
     "epochs": 10,
     "num_labels": 3
 }
@@ -63,7 +63,7 @@ class SentimentDataset(Dataset):
             "attention_mask": tokens["attention_mask"].squeeze(0),
             "labels": torch.tensor(label, dtype=torch.long)
         }
-    
+
 
 # Transformer block with multi-head attention and feedforward layers
 class TransformerBlock(nn.Module):
@@ -106,11 +106,11 @@ class NanoGPTClassifier(nn.Module):
         x = self.token_embed(input_ids) + self.pos_embed(pos)
         x = self.blocks(x)
         x = self.norm(x)
-        x = x[:, -1, :]  # Use the last token's representation
+        x = x[:, -1, :]  # Use the last token's output
         x = self.dropout(x)
         logits = self.classifier(x)
         return logits
-    
+
 
 
 # Load GPT-2 tokenizer
@@ -120,9 +120,18 @@ tokenizer.pad_token = tokenizer.eos_token
 # Load datasets
 train_dataset = SentimentDataset("D:/AODTU CLASS/spring 2025/transformers/gpt2/train.csv", tokenizer)
 val_dataset = SentimentDataset("D:/AODTU CLASS/spring 2025/transformers/gpt2/val.csv", tokenizer)
-
 train_loader = DataLoader(train_dataset, batch_size=config["batch_size"], shuffle=True)
 val_loader = DataLoader(val_dataset, batch_size=config["batch_size"])
+
+
+
+# Compute class weights and boost the positive class
+labels = pd.read_csv("D:/AODTU CLASS/spring 2025/transformers/gpt2/train.csv")["label"].values
+class_counts = np.bincount(labels)
+class_weights = 1.0 / (class_counts + 1e-6)
+class_weights[2] *= 2.0  # Boost positive class
+normalized_weights = class_weights / class_weights.sum()
+weights_tensor = torch.tensor(normalized_weights, dtype=torch.float).to(device)
 
 
 
@@ -138,7 +147,7 @@ model = NanoGPTClassifier(
 ).to(device)
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=config["lr"])
-criterion = nn.CrossEntropyLoss()
+criterion = nn.CrossEntropyLoss(weight=weights_tensor)
 
 
 
@@ -164,9 +173,7 @@ def evaluate(model, dataloader):
     f1 = f1_score(all_labels, all_preds, average="macro", zero_division=0)
     cm = confusion_matrix(all_labels, all_preds)
 
-
-
-    # Plot and log confusion matrix
+     # Plot and log confusion matrix
     fig, ax = plt.subplots(figsize=(6, 5))
     sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
                 xticklabels=["Negative", "Neutral", "Positive"],
@@ -185,13 +192,16 @@ def evaluate(model, dataloader):
     })
 
     plt.close(fig)
-
+    return total_loss / len(dataloader)
 
 
 # Training loop
+best_val_loss = float("inf")
+
 for epoch in range(config["epochs"]):
     model.train()
     running_loss = 0
+
     for step, batch in enumerate(train_loader):
         inputs = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
@@ -203,13 +213,20 @@ for epoch in range(config["epochs"]):
         running_loss += loss.item()
 
         if step % 10 == 0:
-            wandb.log({"train_loss": running_loss / (step + 1)})
+            wandb.log({
+                "train_loss": running_loss / (step + 1),
+                "epoch": epoch,
+                "step": epoch * len(train_loader) + step
+            })
 
-    print(f"Epoch {epoch+1} | Train Loss: {running_loss / len(train_loader):.4f}")
-    evaluate(model, val_loader)
+    print(f"Epoch {epoch + 1} | Train Loss: {running_loss / len(train_loader):.4f}")
+    val_loss = evaluate(model, val_loader)
 
 
+    # Save the trained model
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        torch.save(model.state_dict(), "nanogpt-sentiment.pt")
+        print("Best model saved.")
 
-# Save the trained model
-torch.save(model.state_dict(), "nanogpt-sentiment.pt")
-print("Model saved successfully.")
+print("Training completed.")
