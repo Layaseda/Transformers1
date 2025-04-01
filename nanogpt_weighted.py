@@ -2,7 +2,7 @@ import os
 import warnings
 warnings.simplefilter("ignore", category=FutureWarning)
 
-os.environ["WANDB_PROJECT"] = "gpt2-sentiment"
+os.environ["WANDB_PROJECT"] = "sentiment_analyze"
 os.environ["WANDB_LOG_MODEL"] = "end"
 
 import wandb
