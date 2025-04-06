@@ -18,7 +18,7 @@ from transformers.integrations import WandbCallback
 
 # Suppress warnings and setup wandb
 warnings.simplefilter("ignore", category=FutureWarning)
-os.environ["WANDB_PROJECT"] = "gpt2"
+os.environ["WANDB_PROJECT"] = "gpt222"
 os.environ["WANDB_LOG_MODEL"] = "end"
 
 # Load tokenizer
@@ -115,6 +115,14 @@ def compute_metrics(eval_pred):
 def train():
     wandb.init()
     config = wandb.config
+
+
+    # Fallbacks in case we are not running a sweep
+    #if not hasattr(config, "dropout"):
+    #    config.dropout = 0.3
+    #if not hasattr(config, "learning_rate"):
+    #    config.learning_rate = 5e-5
+
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = GPT2ForSentiment(num_labels=3, dropout=config.dropout).to(device)
@@ -215,9 +223,9 @@ sweep_config = {
 }
 
 
-# Run the training loop using W&B 
+# Run the training loop using W&B
 if __name__ == "__main__":
-    sweep_id = wandb.sweep(sweep_config, project="gpt2")
+    sweep_id = wandb.sweep(sweep_config, project="gpt222")
     wandb.agent(sweep_id, function=train, count=6)
  
 

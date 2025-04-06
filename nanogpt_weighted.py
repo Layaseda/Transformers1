@@ -8,6 +8,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 import numpy as np
+from sklearn.utils.class_weight import compute_class_weight
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
 import matplotlib.pyplot as plt
@@ -16,11 +17,14 @@ matplotlib.use("Agg")
 import seaborn as sns
 from transformers import GPT2Tokenizer
 
+#  WandB Project Name
+os.environ["WANDB_PROJECT"] = "nanogpt_weightedD"
 
-# Sweep configuration
+
+#  Sweep Config
 sweep_config = {
     'method': 'grid',
-    'name': 'nanoGPTT',
+    'name': 'nanogpt_weightedD',
     'parameters': {
         'n_layers': {'values': [4, 6]},
         'dropout': {'values': [0.0, 0.1, 0.2, 0.3]},
@@ -34,8 +38,6 @@ sweep_config = {
         'num_labels': {'value': 3}
     }
 }
-
-
 
 # Dataset class to handle the data loading and tokenization process
 class SentimentDataset(Dataset):
@@ -51,7 +53,7 @@ class SentimentDataset(Dataset):
         text = self.data.iloc[idx]["conversation"]
         label = self.data.iloc[idx]["label"]
 
-        # Tokenize the text (pad to max_length, truncate if necessary)
+        #Tokenize the text (pad to max_length, truncate if necessary)
         tokens = self.tokenizer(text, padding="max_length", truncation=True,
                                 max_length=self.max_length, return_tensors="pt")
         return {
@@ -60,8 +62,7 @@ class SentimentDataset(Dataset):
             "labels": torch.tensor(label, dtype=torch.long)
         }
 
-
-# Transformer block
+#  Transformer Block
 class TransformerBlock(nn.Module):
     def __init__(self, embed_dim, n_heads, dropout):
         super().__init__()
@@ -85,9 +86,9 @@ class TransformerBlock(nn.Module):
         x = self.norm1(x + attn_output)
         x = self.norm2(x + self.ff(x))
         return x
+    
 
-
-# nanoGPT classifier
+#  nanoGPT Classifier
 class NanoGPTClassifier(nn.Module):
     def __init__(self, vocab_size, embed_dim, max_length, n_heads, n_layers, num_labels, dropout):
         super().__init__()
@@ -101,18 +102,15 @@ class NanoGPTClassifier(nn.Module):
         self.classifier = nn.Linear(embed_dim, num_labels)
 
     def forward(self, input_ids):
-        B, T = input_ids.size()
-        pos = torch.arange(0, T, device=input_ids.device).unsqueeze(0)
+        pos = torch.arange(0, input_ids.size(1), device=input_ids.device).unsqueeze(0)
         x = self.token_embed(input_ids) + self.pos_embed(pos)
         x = self.blocks(x)
         x = self.norm(x)
-        x = x[:, -1, :]
-        x = self.dropout(x)
+        x = self.dropout(x[:, -1, :])
         return self.classifier(x)
 
-
-# Evaluation 
-def evaluate(model, dataloader, config, label="val"):
+# Evaluation
+def evaluate(model, dataloader, criterion, config, label="val"):
     model.eval()
     all_preds, all_labels = [], []
     total_loss = 0
@@ -135,7 +133,6 @@ def evaluate(model, dataloader, config, label="val"):
     f1 = f1_score(all_labels, all_preds, average="macro", zero_division=0)
     cm = confusion_matrix(all_labels, all_preds)
 
-    # Plot confusion matrix
     fig, ax = plt.subplots(figsize=(6, 5))
     sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
                 xticklabels=["Negative", "Neutral", "Positive"],
@@ -144,15 +141,17 @@ def evaluate(model, dataloader, config, label="val"):
     plt.ylabel("Actual")
     plt.tight_layout()
 
+    val_loss = total_loss / len(dataloader)
     wandb.log({
         f"{label}_confusion_matrix": wandb.Image(fig),
-        f"{label}_loss": total_loss / len(dataloader),
+        f"{label}_loss": val_loss,
         f"{label}_accuracy": acc,
         f"{label}_precision": precision,
         f"{label}_recall": recall,
         f"{label}_macro_f1": f1
     })
     plt.close(fig)
+    return val_loss
 
 
 # Training function for wandb sweep
@@ -162,11 +161,11 @@ def train():
 
     # Validate head-embedding compatibility
     if config.embed_dim % config.n_heads != 0:
-        print(f"Skipping invalid config: embed_dim={config.embed_dim}, n_heads={config.n_heads}")
-        return
+        raise ValueError(f"embed_dim ({config.embed_dim}) must be divisible by n_heads ({config.n_heads})")
 
     tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
     tokenizer.pad_token = tokenizer.eos_token
+
 
     # Split the training data each run
     df = pd.read_csv("data/train.csv")[["conversation", "label"]]
@@ -174,16 +173,21 @@ def train():
     train_df.to_csv("data/train_split.csv", index=False)
     val_df.to_csv("data/val_split.csv", index=False)
 
-
     train_dataset = SentimentDataset("data/train_split.csv", tokenizer, max_length=config.max_length)
     val_dataset = SentimentDataset("data/val_split.csv", tokenizer, max_length=config.max_length)
-
 
     train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=config.batch_size)
 
 
-    # Create the model and optimizer
+    # Class weights (balanced)
+    # Compute class weights based on the class distribution in the training data
+    y_train = train_df["label"].values
+    class_weights = compute_class_weight(class_weight="balanced", classes=np.unique(y_train), y=y_train)
+    class_weights[2] *= 2.0  # Boost positive class
+    weight_tensor = torch.tensor(class_weights, dtype=torch.float32).to(device)
+
+    # Initialize the NanoGPT model with the specified configuration
     model = NanoGPTClassifier(
         vocab_size=config.vocab_size,
         embed_dim=config.embed_dim,
@@ -194,13 +198,13 @@ def train():
         dropout=config.dropout
     ).to(device)
 
+    # Setup optimizer and loss function
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr)
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(weight=weight_tensor)
 
-    # Early Stopping Variables
+    # Early stopping setup: Initialize best validation loss and patience counter
     best_val_loss = float("inf")
-    patience = 3
-    patience_counter = 0
+    patience, counter = 3, 0
 
     # Training loop
     for epoch in range(config.epochs):
@@ -215,50 +219,43 @@ def train():
             optimizer.step()
             optimizer.zero_grad()
             running_loss += loss.item()
-
+            
+            # Log training loss to W&B every 10 steps
             if step % 10 == 0:
-                wandb.log({"train_loss": running_loss / (step + 1)})
+                wandb.log({
+                    "train_loss": running_loss / (step + 1),
+                    "epoch": epoch + 1
+                })
 
-        print(f"Epoch {epoch+1} | Train Loss: {running_loss / len(train_loader):.4f}")
-        evaluate(model, val_loader, config, label="val")
+        print(f"Epoch {epoch + 1} | Train Loss: {running_loss / len(train_loader):.4f}")
+        val_loss = evaluate(model, val_loader, criterion, config, label="val")  # Pass config here
 
-
-
-        # Get the latest val_loss from wandb history
-        try:
-            current_val_loss = wandb.run.history._data[-1]["val_loss"]
-        except:
-            current_val_loss = float("inf")
-
-
-        # Early stopping logic
-        if current_val_loss < best_val_loss:
-            best_val_loss = current_val_loss
-            patience_counter = 0
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            counter = 0
+            torch.save(model.state_dict(), "nanogpt-weighted-best.pt")
+            print(" Best model saved.")
         else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                print(f"Early stopping triggered at epoch {epoch+1}")
+            counter += 1
+            if counter >= patience:
+                print(f"Early stopping at epoch {epoch+1}")
                 break
-
 
 
     # Final test evaluation
     test_df = pd.read_csv("data/test.csv")[["conversation", "label"]]
-
     test_df.to_csv("data/test_clean.csv", index=False)
 
     test_dataset = SentimentDataset("data/test_clean.csv", tokenizer, max_length=config.max_length)
     test_loader = DataLoader(test_dataset, batch_size=config.batch_size)
 
     print("Evaluating on test set...")
-    evaluate(model, test_loader, config, label="test")
+    evaluate(model, test_loader, criterion, config, label="test")  # Pass config here
 
 
-
-# Set device globally
+# Device Setup
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Register and launch the sweep
-sweep_id = wandb.sweep(sweep_config, project="nanoGPTT")
+# Launch Sweep
+sweep_id = wandb.sweep(sweep_config, project="nanogpt_weightedD")
 wandb.agent(sweep_id, function=train)
