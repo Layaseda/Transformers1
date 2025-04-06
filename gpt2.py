@@ -190,7 +190,7 @@ def train():
 
 
     # Test set evaluation
-    test_dataset = SentimentDataset("D:/AODTU CLASS/spring 2025/transformers/gpt2/test.csv", tokenizer, max_length=512)
+    test_dataset = SentimentDataset("data/test.csv", tokenizer, max_length=512)
     test_metrics = trainer.evaluate(test_dataset)
     print("Test Evaluation:", test_metrics)
 
