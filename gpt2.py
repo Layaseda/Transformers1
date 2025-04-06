@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 
 from torch import nn
 from torch.utils.data import Dataset
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
 from transformers import (
     GPT2Model, GPT2Tokenizer, Trainer, TrainingArguments, EarlyStoppingCallback
@@ -17,18 +18,16 @@ from transformers.integrations import WandbCallback
 
 # Suppress warnings and setup wandb
 warnings.simplefilter("ignore", category=FutureWarning)
-os.environ["WANDB_PROJECT"] = "sentiment_sweep"
+os.environ["WANDB_PROJECT"] = "gpt2"
 os.environ["WANDB_LOG_MODEL"] = "end"
-
 
 # Load tokenizer
 tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
 tokenizer.pad_token = tokenizer.eos_token
 
-
 # Dataset class
 class SentimentDataset(Dataset):
-    def __init__(self, csv_path, tokenizer, max_length=128):
+    def __init__(self, csv_path, tokenizer, max_length=512):
         self.data = pd.read_csv(csv_path)
         self.tokenizer = tokenizer
         self.max_length = max_length
@@ -41,6 +40,8 @@ class SentimentDataset(Dataset):
     def __getitem__(self, idx):
         text = self.data.iloc[idx]["conversation"]
         label = self.data.iloc[idx]["label"]
+
+        # Tokenize the conversation text
         inputs = self.tokenizer(
             text,
             truncation=True,
@@ -53,9 +54,8 @@ class SentimentDataset(Dataset):
             "attention_mask": inputs["attention_mask"].squeeze(),
             "labels": torch.tensor(label, dtype=torch.long)
         }
-    
 
-# Model
+# GPT-2 model with classification head for sentiment analysis
 class GPT2ForSentiment(nn.Module):
     def __init__(self, num_labels, dropout):
         super().__init__()
@@ -79,8 +79,7 @@ class GPT2ForSentiment(nn.Module):
         self._is_training = mode
         return self
 
-
-# Metrics
+# Function to calculate evaluation metrics 
 def compute_metrics(eval_pred):
     logits, labels = eval_pred
     preds = np.argmax(logits, axis=-1)
@@ -92,13 +91,6 @@ def compute_metrics(eval_pred):
         "macro_f1": f1_score(labels, preds, average="macro", zero_division=0),
     }
 
-
-    # Eval loss
-    loss_fct = torch.nn.CrossEntropyLoss()
-    loss = loss_fct(torch.tensor(logits, dtype=torch.float32), torch.tensor(labels, dtype=torch.long))
-    metrics["eval_loss"] = loss.item()
-
-
     # Confusion Matrix
     cm = confusion_matrix(labels, preds)
     fig, ax = plt.subplots(figsize=(6, 5))
@@ -109,6 +101,7 @@ def compute_metrics(eval_pred):
     plt.ylabel("Actual")
     plt.title("Confusion Matrix")
     plt.tight_layout()
+
     wandb.log({
         "confusion_matrix": wandb.Image(fig),
         **metrics
@@ -127,17 +120,29 @@ def train():
     model = GPT2ForSentiment(num_labels=3, dropout=config.dropout).to(device)
     model.train()
 
-    train_dataset = SentimentDataset("D:/AODTU CLASS/spring 2025/transformers/gpt2/train.csv", tokenizer)
-    val_dataset = SentimentDataset("D:/AODTU CLASS/spring 2025/transformers/gpt2/val.csv", tokenizer)
+    full_df = pd.read_csv("data/train.csv")  
 
+    # Split into train and validation sets
+    train_df, val_df = train_test_split(full_df, test_size=0.2, stratify=full_df["label"], random_state=42)
+
+    # Save temporary CSVs for training/validation
+    train_df.to_csv("temp_train.csv", index=False)
+    val_df.to_csv("temp_val.csv", index=False)
+
+    # Load datasets from temporary CSVs
+    train_dataset = SentimentDataset("temp_train.csv", tokenizer, max_length=512)
+    val_dataset = SentimentDataset("temp_val.csv", tokenizer, max_length=512)
+
+
+    # Training arguments for Hugging Face Trainer
     training_args = TrainingArguments(
-        output_dir="./tmp",                      
+        output_dir="./tmp",
         overwrite_output_dir=True,
         evaluation_strategy="steps",
         eval_steps=50,
         save_strategy="steps",
-        save_steps=100,                           
-        save_total_limit=1,                       
+        save_steps=100,
+        save_total_limit=1,
         max_steps=500,
         per_device_train_batch_size=8,
         per_device_eval_batch_size=16,
@@ -151,11 +156,14 @@ def train():
         greater_is_better=False,
         fp16=torch.cuda.is_available(),
         report_to="wandb",
-        logging_dir=None,
+        logging_strategy="steps",      
+        logging_steps=10,              
         seed=42,
-        disable_tqdm=True                        
+        disable_tqdm=True
     )
 
+
+    # Trainer setup with early stopping
     trainer = Trainer(
         model=model,
         args=training_args,
@@ -168,32 +176,48 @@ def train():
         )]
     )
 
-    
-    # Prevent duplicate wandb end logging
+    # Disable W&B ending callback to avoid bugs
     WandbCallback.on_train_end = lambda *args, **kwargs: None
 
+    # Train the model
     trainer.train()
     model.eval()
-    final_metrics = trainer.evaluate()
-    print("Final Evaluation:", final_metrics)
+
+
+    # Evaluate on validation set
+    val_metrics = trainer.evaluate()
+    print("Validation Evaluation:", val_metrics)
+
+
+    # Test set evaluation
+    test_dataset = SentimentDataset("D:/AODTU CLASS/spring 2025/transformers/gpt2/test.csv", tokenizer, max_length=512)
+    test_metrics = trainer.evaluate(test_dataset)
+    print("Test Evaluation:", test_metrics)
+
+     # Log test metrics to W&B
+    wandb.log({f"test_{k}": v for k, v in test_metrics.items()})
+
+
+    # Clean up
+    os.remove("temp_train.csv")
+    os.remove("temp_val.csv")
 
     wandb.finish()
 
-
-# Sweep config
+# Sweep configuration
 sweep_config = {
     "method": "grid",
     "metric": {"name": "macro_f1", "goal": "maximize"},
     "parameters": {
         "learning_rate": {"values": [1e-5, 5e-5]},
-        "dropout": {"values": [0.1, 0.3, 0.5]}
+        "dropout": {"values": [0.1, 0.3, 0.4, 0.5]} 
     }
 }
 
-# Main
+
+# Run the training loop using W&B 
 if __name__ == "__main__":
-    sweep_id = wandb.sweep(sweep_config, project="sentiment_sweep")
-    wandb.agent(sweep_id, function=train, count=6)  
-
-
+    sweep_id = wandb.sweep(sweep_config, project="gpt2")
+    wandb.agent(sweep_id, function=train, count=6)
+ 
 
